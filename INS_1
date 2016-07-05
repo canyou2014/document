@@ -1,0 +1,340 @@
+function [x,zupt,fiii] = INS_1(u)
+settings();%设置参数
+global initial
+zupt = ZUPTDetector(u);%零速检测
+
+N = length(u);
+
+[P,Q,R,H,x] = init_matrix(N);%初始化协方差矩阵，以及各矩阵维数
+[x(1:9,1),d_x,quat]=init_state(u);%初始化x和四元数。x包含2组三维元素：位置，速度。quat为4x1
+
+for k = 2:N
+%%  if(mod(k,2460*6) == 0)
+%     P=zeros(15);
+%    P(10:12,10:12)=diag(1*initial.P_acc_bias.^2);
+%    P(13:15,13:15)=diag(1*initial.P_gyro_bias.^2);  
+%    P(1:3,1:3)=diag(1*initial.P_pos.^2);
+%    P(4:6,4:6)=diag(1*initial.P_vel.^2);
+%    P(7:9,7:9)=diag(1*initial.P_att.^2);
+      
+%  end
+    u_c = u(1:6,k)+d_x(10:15); %补偿加速度和角速度 
+    [x(:,k),quat,Cbn] = state_update(x(:,k-1),u_c,quat);%状态更新和四元数更新  
+    [F,G] = state_transition_matrix(Cbn,u_c);%求卡尔曼状态转移矩阵，F为15x15,G为15x12
+    P=F*P*F'+G*Q*G';%协方差矩阵时间更新,P为15x15
+    P=(P+P')/2;%使P对称，减少EKF发散的可能性
+    fiii(k) = atan2(Cbn(2,1),Cbn(1,1));
+if zupt(k) == true%检测到零速度，运行EKF
+    
+      m = -x(4:6,k);%观测量    
+      K=(P*H')/(H*P*H'+R);%增益
+      d_x = K*m; %误差最优估计
+     [x(:,k),quat] = correct_state(d_x,Cbn,x(:,k));%通过误差对x进行补偿   
+      P=(eye(15)-K*H)*P;%协方差的量测更新
+      P=(P+P')/2;
+end    
+end
+end
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%
+%矩阵初始化函数
+%N为初始数据的数据长度
+%P为状态协方差矩阵
+%Q为过程噪声协方差矩阵
+%R为量测噪声协方差矩阵
+%x为输出状态向量
+function [P,Q,R,H,x] = init_matrix(N)
+    global initial
+      
+    P=zeros(15);
+    P(10:12,10:12)=diag(1*initial.P_acc_bias.^2);
+    P(13:15,13:15)=diag(1*initial.P_gyro_bias.^2);  
+    P(1:3,1:3)=diag(1*initial.P_pos.^2);
+    P(4:6,4:6)=diag(1*initial.P_vel.^2);
+    P(7:9,7:9)=diag(1*initial.P_att.^2);
+
+    Q=zeros(12);
+    Q(7:9,7:9)=diag(1*initial.Q_acc_bias_noise.^2);
+    Q(10:12,10:12)=diag(1*initial.Q_gyro_bias_noise.^2);
+    Q(1:3,1:3)=diag(1*initial.Q_acc.^2);
+    Q(4:6,4:6)=diag(1*initial.Q_gyro.^2);
+    
+    R = zeros(3);  
+    R(1:3,1:3)=diag(1*initial.R_vel.^2);
+   
+    H=zeros(3,15);
+    H(1:3,4:6)=eye(3);
+%    P = single(P);
+%    Q = single(Q);
+%    H = single(H);
+%    R = single(R);
+    x = zeros(9,N);
+%     x = single(x);
+
+end
+%%
+%四元数和状态向量x初始化函数
+%x0为初始化输出状态向量
+%q为初始化四元数
+%u为原始数据输入
+function [x0,dx,q]=init_state(u)
+
+    a_x=mean(u(1,1:240));
+    a_y=mean(u(2,1:240));
+    a_z=mean(u(3,1:240));
+    u0(1:3) = mean(u(7:9,1:240),2);
+    roll=atan2(-a_y,-a_z);
+    pitch=atan2(a_x,sqrt(a_y^2+a_z^2));
+    yaw = compa_d([roll,pitch],u0);
+   
+    
+    attitude=[roll pitch yaw]';
+
+    Cbn=att2Cbn(attitude);
+    q = Cbn2q(Cbn);
+
+    x0=zeros(9,1);
+    dx = zeros(15,1);
+%     dx = single(dx);
+end
+%%
+%x和四元数更新函数
+%输入分别为上一时刻的x，本时刻的加速度角速度信息和四元数，输出为本时刻的x和四元数
+function [x_out,q_out,Cbn]=state_update(x_in,u,q_in)
+global initial;
+ts = initial.ts;
+
+w_tb = u(4:6)*ts;
+
+ou = 0.5*[0,-w_tb(1),-w_tb(2),-w_tb(3);
+          w_tb(1),0,w_tb(3),-w_tb(2);
+          w_tb(2),-w_tb(3),0,w_tb(1);
+          w_tb(3),w_tb(2),-w_tb(1),0];  
+v=norm(w_tb);
+if v~=0
+    q_out=(cos(v/2)*eye(4)+2/v*sin(v/2)*ou )*q_in;
+    q_out=q_out./norm(q_out);
+else
+    q_out = q_in;
+end
+
+Cbn = q2Cbn(q_out);
+g_n=[0,0,initial.g]';
+a_n=Cbn*u(1:3);
+acc_n=a_n+g_n;
+
+A=eye(6); A(1,4)=ts; A(2,5)=ts; A(3,6)=ts;
+
+B=[(ts^2)/2*eye(3);ts*eye(3)];
+
+x_out(1:6)=A*x_in(1:6)+B*acc_n;
+x_out(7) = atan2(Cbn(3,2),Cbn(3,3));
+x_out(8) = asin(-Cbn(3,1));
+x_out(9) = atan2(Cbn(2,1),Cbn(1,1));
+end
+%%
+%求状态转移矩阵，q为四元数，u为加速度信息
+%F为15x15，G为15x12
+function [F,G]=state_transition_matrix(Cbn,u)
+global initial
+ts = initial.ts;
+
+O = zeros(3);
+ I = eye(3);
+
+a_n = Cbn*u(1:3);
+St=[0,-a_n(3),a_n(2); a_n(3) 0,-a_n(1); -a_n(2),a_n(1),0];
+
+G=[O,O,O,O; Cbn,O,O,O; O,-Cbn,O,O; O,O,I,O; O,O,O,I];%15x12
+
+ F = zeros(15);
+F(1:3,4:6) = I;
+F(4:6,10:12) = Cbn;
+F(4:6,7:9) = St;
+F(7:9,13:15) = -Cbn;
+F = eye(15)+F.*ts;
+G = G.*ts;        
+end
+%%
+%x和四元数补偿，dx为卡尔曼求得的误差，
+function [x_out,q_out] = correct_state(dx,Cbn,x_in)
+
+x_out(1:6) = x_in(1:6)+dx(1:6);%补偿位置和速度
+
+epsilon = dx(7:9);
+fii =  [0 -epsilon(3) epsilon(2); epsilon(3) 0 -epsilon(1); -epsilon(2) epsilon(1) 0];
+Cbn = (eye(3)-fii)*Cbn;%补偿姿态矩阵
+x_out(7) = atan2(Cbn(3,2),Cbn(3,3));
+x_out(8) = asin(-Cbn(3,1));
+x_out(9) = atan2(Cbn(2,1),Cbn(1,1));
+q_out = Cbn2q(Cbn);
+end
+
+%%
+%ZUPT检测
+function zupt = ZUPTDetector(u)
+global initial
+g=initial.g;
+sigma_a=1*initial.sigma_a^2;
+sigma_g=1*initial.sigma_g^2;
+W=initial.Window_size;
+
+N=length(u);
+zupt=zeros(1,length(u));
+T=zeros(1,N-W+1);
+for k=1:N-W+1
+   
+    a_m=mean(u(1:3,k:k+W-1),2);
+    
+    for l=k:k+W-1
+        tmp=u(1:3,l)-g*a_m/norm(a_m);
+        T(k)=T(k)+u(4:6,l)'*u(4:6,l)/sigma_g+tmp'*tmp/sigma_a;    
+    end    
+end
+T=T./W;
+
+for k=1:length(T)
+    if T(k)<1*initial.gamma
+       zupt(k:k+W-1)=ones(1,W); 
+    end    
+end
+
+end
+%%
+%参数设置
+function settings()
+
+global initial;
+
+initial.latitude=40;
+
+initial.altitude=43.1;
+
+initial.g=gravity(initial.latitude,initial.altitude);
+initial.g=9.8114;
+initial.ts=1/250;
+
+initial.sigma_a=0.015;%% 
+
+initial.sigma_g=0.333*pi/180;     
+
+initial.Window_size=3;
+
+initial.gamma=0.3e5; 
+
+%R
+initial.R_vel=0.09*ones(3,1);      
+
+%P 
+initial.P_pos=1e-5*ones(3,1);               
+initial.P_vel=1e-5*ones(3,1);               
+initial.P_att=0.09*pi/180*ones(3,1);     
+initial.P_acc_bias=0.003*ones(3,1);           
+initial.P_gyro_bias=0.003*pi/180*ones(3,1);                                
+
+% Q动态误差时间常数 
+
+initial.Q_acc_bias_noise=0.0000001*ones(3,1); 
+initial.Q_gyro_bias_noise=0.0000001*pi/180*ones(3,1); 
+initial.Q_acc =0.12*ones(3,1);
+initial.Q_gyro =1.6*ones(3,1)*pi/180;
+end
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%
+%姿态矩阵转四元数
+function q=Cbn2q(Cbn)
+
+tr=Cbn(1,1)+Cbn(2,2)+Cbn(3,3);
+Pa=1+tr;
+Pb=1+2*Cbn(1,1)-tr;
+Pc=1+2*Cbn(2,2)-tr;
+Pd=1+2*Cbn(3,3)-tr;
+
+q=zeros(4,1);
+if (Pa>0)
+    q(1)=0.5*sqrt(Pa);
+    q(2)=(Cbn(3,2)-Cbn(2,3))/4/q(1);
+    q(3)=(Cbn(1,3)-Cbn(3,1))/4/q(1);
+    q(4)=(Cbn(2,1)-Cbn(1,2))/4/q(1);
+elseif (Pb>=Pc && Pb>=Pd)
+    q(2)=0.5*sqrt(Pb);
+    q(3)=(Cbn(2,1)+Cbn(1,2))/4/q(2);
+    q(4)=(Cbn(1,3)+Cbn(3,1))/4/q(2);
+    q(1)=(Cbn(3,2)-Cbn(2,3))/4/q(2);
+elseif (Pc>=Pd)
+    q(3)=0.5*sqrt(Pc);
+    q(4)=(Cbn(3,2)+Cbn(2,3))/4/q(3);
+    q(1)=(Cbn(1,3)-Cbn(3,1))/4/q(3);
+    q(2)=(Cbn(2,1)+Cbn(1,2))/4/q(3);
+else
+    q(4)=0.5*sqrt(Pd);
+    q(1)=(Cbn(2,1)-Cbn(1,2))/4/q(4);
+    q(2)=(Cbn(1,3)+Cbn(3,1))/4/q(4);
+    q(3)=(Cbn(3,2)+Cbn(2,3))/4/q(4);
+end
+
+if (q(1)<=0)
+    q=-q;
+end
+
+end
+%%
+%四元数转姿态矩阵
+function Cbn=q2Cbn(q)
+
+q0 = q(1);
+q1 = q(2);
+q2 = q(3);
+q3 = q(4);
+
+Cbn(1,1) = q0^2+q1^2-q2^2-q3^2;
+Cbn(2,2) = q0^2-q1^2+q2^2-q3^2;
+Cbn(3,3) = q0^2-q1^2-q2^2+q3^2;
+Cbn(1,2) = 2*(q1*q2-q0*q3);
+Cbn(1,3) = 2*(q1*q3+q0*q2);
+Cbn(2,1) = 2*(q1*q2+q0*q3);
+Cbn(2,3) = 2*(q2*q3-q0*q1);
+Cbn(3,1) = 2*(q1*q3-q0*q2);
+Cbn(3,2) = 2*(q2*q3+q0*q1);
+if(q0^2+q1^2+q2^2+q3^2>0)
+    Cbn = Cbn/sqrt(q0^2+q1^2+q2^2+q3^2);
+else
+    Cbn = eye(3); 
+end
+
+end
+
+%%
+%姿态角转姿态矩阵
+function Cbn=att2Cbn(att)
+
+cr=cos(att(1));
+sr=sin(att(1));
+
+cp=cos(att(2));
+sp=sin(att(2));
+
+cy=cos(att(3));
+sy=sin(att(3));
+
+Cbn = [cy*cp,-sy*cr+cy*sp*sr,sy*sr+cy*sp*sr;
+       sy*cp,cy*cr+sy*sp*sr,-cy*sr+sy*sp*cr;
+       -sp,cp*sr,cp*cr];
+end
+%%
+%通过磁力计求航向
+%由当前姿态角和三轴磁力参数求得航向角
+function fi = compa_d(x,u)
+Bx = u(1)*cos(x(2))+u(2)*sin(x(2))*sin(x(1))+u(3)*sin(x(2))*cos(x(1));
+By = u(2)*cos(x(1))-u(3)*sin(x(1));
+fi= atan2(-By,Bx);
+end
+
+%%
+%由纬度和海拔求重力加速度
+function g=gravity(latitude,altitude)
+
+latitude=pi/180*latitude;
+g0=9.780327*(1+0.0053024*sin(latitude)^2-0.0000058*sin(2*latitude)^2);
+g=g0-((3.0877e-6)-(0.004e-6)*sin(latitude)^2)*altitude+(0.072e-12)*altitude^2;
+end
